@@ -1,217 +1,152 @@
-import os
 import requests
-import webbrowser
-import http.server
-import socketserver
-import urllib.parse
-from pathlib import Path
-from threading import Thread
+from bs4 import BeautifulSoup
+import shutil
+import os
+import sys
+import tkinter as tk
+from tkinter import simpledialog
 import time
-import re
-from tqdm import tqdm
-from requests_toolbelt.multipart.encoder import MultipartEncoder, MultipartEncoderMonitor
 
-# Configuration
-CLIENT_ID = ""  # Your DeviantArt Client ID
-CLIENT_SECRET = ""  # Your Client Secret
-REDIRECT_URI = "http://localhost:3000/callback"  # Must be whitelisted in DeviantArt app settings
-AUTH_URL = "https://www.deviantart.com/oauth2/authorize"
-TOKEN_URL = "https://www.deviantart.com/oauth2/token"
-STASH_SUBMIT_URL = "https://www.deviantart.com/api/v1/oauth2/stash/submit"
-PUBLISH_URL = "https://www.deviantart.com/api/v1/oauth2/stash/publish"
-BASE_DESCRIPTION = ""  # Base description
-TAGS = ["mosaic"]  # Customize tags
-FOLDER_ID = "93949399"  # Your gallery folderid; set to None for default gallery
-ACCESS_TOKEN_FILE = "access_token.txt"  # File to store access token
-IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif")
+# Constants
+START_PAGE = 0
+IMAGES_PER_PAGE = 50
+TIMEOUT = 20
+MAX_RETRIES = 3
+RETRY_DELAY = 2  # Seconds to wait between retries
 
-# Global variable to store authorization code
-auth_code = None
+# Headers to mimic a browser
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+    'Referer': 'https://www.listal.com/',
+}
 
-def parse_filename_to_title(filename):
-    name_without_ext = filename.rsplit('.', 1)[0]
-    name_without_resized = name_without_ext.replace('_resized', '')
-    parts = name_without_resized.split('_')
-    if len(parts) < 3 or not parts[0].startswith('mosaic'):
-        return "Unknown", "1", "unknown"
-    name_part = parts[1]
-    image_count = parts[2]
-    cleaned_name = re.sub(r'-+', '-', name_part).replace('-', ' ').strip()
-    cleaned_name = ' '.join(word.capitalize() for word in cleaned_name.split())
-    return cleaned_name, image_count, name_part
+# Initialize Tkinter
+ws = tk.Tk()
+ws.title("Scrape Listal")
+ws.overrideredirect(1)
+ws.withdraw()
 
-def start_local_server(port=3000):
-    class OAuthHandler(http.server.SimpleHTTPRequestHandler):
-        def do_GET(self):
-            global auth_code
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            query = urllib.parse.urlparse(self.path).query
-            params = urllib.parse.parse_qs(query)
-            if "code" in params:
-                auth_code = params["code"][0]
-                self.wfile.write(b"Authorization successful! You can close this window.")
-            else:
-                self.wfile.write(b"Error: No authorization code received.")
-    try:
-        with socketserver.TCPServer(("", port), OAuthHandler) as httpd:
-            print(f"Local server started at http://localhost:{port}")
-            httpd.handle_request()
-            print("Local server stopped.")
-    except OSError as e:
-        print(f"Error starting server on port {port}: {e}")
-        raise
+# Get user input
+base_url = simpledialog.askstring("Input", "Url", parent=ws)
+pagination = simpledialog.askinteger("Input", "Number of Pages", parent=ws)
 
-def get_access_token():
-    if os.path.exists(ACCESS_TOKEN_FILE):
-        with open(ACCESS_TOKEN_FILE, "r") as f:
-            token = f.read().strip()
-            if token:
-                print("Using stored access token.")
-                return token
-        os.remove(ACCESS_TOKEN_FILE)
-    auth_params = {
-        "response_type": "code",
-        "client_id": CLIENT_ID,
-        "redirect_uri": REDIRECT_URI,
-        "scope": "stash browse publish",
-        "state": "random_state"
-    }
-    auth_url = f"{AUTH_URL}?{urllib.parse.urlencode(auth_params)}"
-    print(f"Opening browser for authorization: {auth_url}")
-    webbrowser.open(auth_url)
-    server_thread = Thread(target=start_local_server)
-    server_thread.start()
-    server_thread.join()
-    if not auth_code:
-        raise Exception("Failed to obtain authorization code.")
-    token_data = {
-        "grant_type": "authorization_code",
-        "code": auth_code,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "redirect_uri": REDIRECT_URI
-    }
-    response = requests.post(TOKEN_URL, data=token_data)
-    response.raise_for_status()
-    token_json = response.json()
-    access_token = token_json.get("access_token")
-    if not access_token:
-        raise Exception(f"Failed to obtain access token: {token_json}")
-    with open(ACCESS_TOKEN_FILE, "w") as f:
-        f.write(access_token)
-    print("Access token saved to access_token.txt")
-    return access_token
+# Validate inputs
+if not base_url or not pagination:
+    print("Invalid input. Exiting...")
+    ws.destroy()
+    sys.exit(1)
 
-def get_image_files():
-    root_dir = Path(__file__).parent
-    return [f for f in root_dir.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
+# Create directory based on base_url
+folder = base_url.replace("https://www.listal.com/", "").replace("/pictures", "")
+if not os.path.exists(folder):
+    os.makedirs(folder)
+folder = f"./{folder}/"
 
-def upload_image(file_path, caption, description, tags, access_token):
-    try:
-        file = open(file_path, 'rb')
-        fields = []
-        fields.append(('test', (file_path.name, file, 'application/octet-stream')))
-        fields.append(('title', caption))
-        fields.append(('artist_comments', description))
-        for t in tags:
-            fields.append(('tags[]', t))
-        fields.append(('access_token', access_token))
-        encoder = MultipartEncoder(fields=fields)
-        pbar = tqdm(total=encoder.len, unit='B', unit_scale=True, desc=f"Uploading {file_path.name}", leave=True)
-        monitor = MultipartEncoderMonitor(encoder, lambda m: pbar.update(m.bytes_read - pbar.n))
-        headers = {'Content-Type': monitor.content_type}
-        response = requests.post(STASH_SUBMIT_URL, data=monitor, headers=headers)
-        pbar.close()
-        file.close()
-        response.raise_for_status()
-        result = response.json()
-        if result.get("status") == "success":
-            itemid = result.get("itemid")
-            stash_url = f"https://sta.sh/0{int(itemid):x}" if itemid else "https://sta.sh/"
-            print(f"Successfully uploaded {file_path.name}: itemid={itemid}, url={stash_url}")
-            return itemid, stash_url
-        else:
-            print(f"Upload failed: {result.get('error_description', 'Unknown error')}")
-            return None, None
-    except Exception as e:
-        print(f"Error uploading {file_path.name}: {e}")
-        return None, None
+def update_progress(progress, total, image):
+    filled_length = int(round(100 * progress / float(total)))
+    sys.stdout.write(f'\r [\033[1;34mPROGRESS\033[0;0m] [\033[0;32m{"#" * (filled_length // 5)}\033[0;0m]:{filled_length}% {progress}/{total} : {image}')
+    if progress == total:
+        sys.stdout.write('\n')
+    sys.stdout.flush()
 
-def publish_image(itemid, caption, description, tags, folderid, access_token):
-    try:
-        data = {
-            "itemid": itemid,
-            "title": caption,
-            "artist_comments": description,
-            "tags[]": tags,
-            "is_mature": "false",
-            "access_token": access_token
-        }
-        if folderid:
-            data["folderid"] = folderid
-        response = requests.post(PUBLISH_URL, data=data)
-        response.raise_for_status()
-        result = response.json()
-        if result.get("status") == "success":
-            print(f"Published itemid={itemid} to gallery: deviationid={result['deviationid']}")
-            return True
-        else:
-            print(f"Publish failed: {result.get('error_description', 'Unknown error')}")
-            return False
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            print("Publish failed, check 'publish' scope or FOLDER_ID.")
-        else:
-            print(f"Error publishing: {e}")
-        return False
+# Calculate total images
+total_image_count = (pagination - START_PAGE) * IMAGES_PER_PAGE
+current_image_count = 0
+duplicate_count = 0
 
-def main():
-    try:
-        access_token = get_access_token()
-    except Exception as e:
-        print(f"Auth error: {e}")
-        return
+# Create a requests session for connection reuse
+session = requests.Session()
+session.headers.update(HEADERS)
 
-    image_files = get_image_files()
-    if not image_files:
-        print("No images found.")
-        return
-    print(f"Found {len(image_files)} image(s) to upload.")
+try:
+    print(f"Total Images to Download: {total_image_count}")
+    for page in range(START_PAGE, pagination):
+        url = base_url if page == 0 else f"{base_url}/{page}"
+        print(f"\nScraping from: {url}")
 
-    # Sort files to ensure consistent processing order
-    image_files.sort(key=lambda x: x.name)
+        # Fetch page with retries
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = session.get(url, timeout=TIMEOUT)
+                response.raise_for_status()  # Raise exception for bad status codes
+                soup = BeautifulSoup(response.text, 'html.parser')
+                images = soup.find_all(class_='imagewrap-inner')
+                print(f"Found {len(images)} images on page {page}")
+                break
+            except requests.RequestException as e:
+                if attempt < MAX_RETRIES - 1:
+                    print(f"Error fetching page {url}: {e}. Retrying in {RETRY_DELAY} seconds...")
+                    time.sleep(RETRY_DELAY)
+                else:
+                    print(f"Failed to fetch page {url} after {MAX_RETRIES} attempts: {e}")
+                    images = []  # Set empty list to skip this page
+                    break
 
-    previous_sub_name = None
-    counter = 11  # Starting counter
+        for index, item in enumerate(images):
+            current_image_count += 1
+            try:
+                # Fetch individual image page
+                image_page_url = item.find('a')['href']
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        response = session.get(image_page_url, timeout=TIMEOUT)
+                        response.raise_for_status()
+                        individual_soup = BeautifulSoup(response.text, 'html.parser')
+                        found = individual_soup.find(id='itempagewrapper')
+                        if not found:
+                            print(f"No image found on {image_page_url}")
+                            continue
+                        img_url = found.find('img')['src']
+                        break
+                    except requests.RequestException as e:
+                        if attempt < MAX_RETRIES - 1:
+                            print(f"Error fetching image page {image_page_url}: {e}. Retrying in {RETRY_DELAY} seconds...")
+                            time.sleep(RETRY_DELAY)
+                        else:
+                            print(f"Failed to fetch image page {image_page_url} after {MAX_RETRIES} attempts: {e}")
+                            continue
+                    except (AttributeError, TypeError) as e:
+                        print(f"Error parsing image page {image_page_url}: {e}")
+                        break
 
-    for image_path in image_files:
-        name, image_count, sub_name = parse_filename_to_title(image_path.name)
-        
-        # Reset counter if sub_name is different from previous
-        if previous_sub_name is not None and sub_name != previous_sub_name:
-            counter = 11
-            print(f"Sub-name changed from '{previous_sub_name}' to '{sub_name}'. Resetting counter to {counter}.")
-        
-        # Update previous_sub_name
-        previous_sub_name = sub_name
+                if not img_url:
+                    continue
 
-        # Split name into individual tags to avoid spaces in DeviantArt tags
-        tags_list = TAGS + name.split()
-        caption = f"Mosaic - {name} #{counter}"
-        description = f"{BASE_DESCRIPTION} Mosaic made of {image_count} images."
-        print(f"Processing {image_path.name} as '{caption}' with tags: {tags_list}")
+                # Download image
+                file_name = os.path.join(folder, img_url.split('/')[-1])
+                base, ext = os.path.splitext(file_name)
+                
+                # Handle duplicate filenames
+                while os.path.exists(file_name):
+                    duplicate_count += 1
+                    file_name = f"{base}_{duplicate_count}{ext}"
 
-        itemid, stash_url = upload_image(image_path, caption, description, tags_list, access_token)
-        if not itemid:
-            print("Upload failed, skipping publish.")
-        else:
-            if not publish_image(itemid, caption, description, tags_list, FOLDER_ID, access_token):
-                print(f"Manual publish needed: {stash_url}")
+                for attempt in range(MAX_RETRIES):
+                    try:
+                        res = session.get(img_url, stream=True, timeout=TIMEOUT)
+                        res.raise_for_status()
+                        with open(file_name, 'wb') as f:
+                            shutil.copyfileobj(res.raw, f)
+                        if os.path.exists(file_name):
+                            update_progress(current_image_count, total_image_count, os.path.basename(file_name))
+                        else:
+                            print(f"Failed to save image: {file_name}")
+                        break
+                    except requests.RequestException as e:
+                        if attempt < MAX_RETRIES - 1:
+                            print(f"Error downloading image {img_url}: {e}. Retrying in {RETRY_DELAY} seconds...")
+                            time.sleep(RETRY_DELAY)
+                        else:
+                            print(f"Failed to download image {img_url} after {MAX_RETRIES} attempts: {e}")
+            except Exception as e:
+                print(f"Error processing image {index + 1} on page {page}: {e}")
+                continue
 
-        counter += 1  # Increment counter after processing each image
-        time.sleep(2)
-
-if __name__ == "__main__":
-    main()
+except Exception as e:
+    print(f"Script terminated with error: {e}")
+finally:
+    session.close()
+    ws.destroy()
+    print("Script completed.")
